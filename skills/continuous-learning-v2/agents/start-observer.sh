@@ -14,6 +14,9 @@
 
 set -e
 
+# NOTE: set -e is disabled inside the background subshell below
+# to prevent claude CLI failures from killing the observer loop.
+
 # ─────────────────────────────────────────────
 # Project detection
 # ─────────────────────────────────────────────
@@ -132,23 +135,32 @@ case "${1:-start}" in
 
     echo "Starting observer agent for ${PROJECT_NAME}..."
 
-    # The observer loop — fully detached with nohup, IO redirected to log
-    nohup /bin/bash -c '
+    # The observer loop — fully detached with nohup, IO redirected to log.
+    # Variables passed safely via env to avoid shell injection from special chars in paths.
+    nohup env \
+      CONFIG_DIR="$CONFIG_DIR" \
+      PID_FILE="$PID_FILE" \
+      LOG_FILE="$LOG_FILE" \
+      OBSERVATIONS_FILE="$OBSERVATIONS_FILE" \
+      INSTINCTS_DIR="$INSTINCTS_DIR" \
+      PROJECT_DIR="$PROJECT_DIR" \
+      PROJECT_NAME="$PROJECT_NAME" \
+      PROJECT_ID="$PROJECT_ID" \
+      MIN_OBSERVATIONS="$MIN_OBSERVATIONS" \
+      OBSERVER_INTERVAL_SECONDS="$OBSERVER_INTERVAL_SECONDS" \
+      /bin/bash -c '
       set +e
       unset CLAUDECODE
 
-      CONFIG_DIR="'"$CONFIG_DIR"'"
-      PID_FILE="'"$PID_FILE"'"
-      LOG_FILE="'"$LOG_FILE"'"
-      OBSERVATIONS_FILE="'"$OBSERVATIONS_FILE"'"
-      INSTINCTS_DIR="'"$INSTINCTS_DIR"'"
-      PROJECT_DIR="'"$PROJECT_DIR"'"
-      PROJECT_NAME="'"$PROJECT_NAME"'"
-      PROJECT_ID="'"$PROJECT_ID"'"
-      MIN_OBSERVATIONS="'"$MIN_OBSERVATIONS"'"
-      OBSERVER_INTERVAL_SECONDS="'"$OBSERVER_INTERVAL_SECONDS"'"
+      SLEEP_PID=""
+      USR1_FIRED=0
 
-      trap "rm -f \"$PID_FILE\"; exit 0" TERM INT
+      cleanup() {
+        [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
+        rm -f "$PID_FILE"
+        exit 0
+      }
+      trap cleanup TERM INT
 
       analyze_observations() {
         if [ ! -f "$OBSERVATIONS_FILE" ]; then
@@ -216,7 +228,14 @@ Rules:
         fi
       }
 
-      trap "analyze_observations" USR1
+      on_usr1() {
+        # Kill pending sleep to avoid leak, then analyze
+        [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
+        SLEEP_PID=""
+        USR1_FIRED=1
+        analyze_observations
+      }
+      trap on_usr1 USR1
 
       echo "$$" > "$PID_FILE"
       echo "[$(date)] Observer started for ${PROJECT_NAME} (PID: $$)" >> "$LOG_FILE"
@@ -224,8 +243,16 @@ Rules:
       while true; do
         # Interruptible sleep — allows USR1 trap to fire immediately
         sleep "$OBSERVER_INTERVAL_SECONDS" &
-        wait $!
-        analyze_observations
+        SLEEP_PID=$!
+        wait $SLEEP_PID 2>/dev/null
+        SLEEP_PID=""
+
+        # Skip scheduled analysis if USR1 already ran it
+        if [ "$USR1_FIRED" -eq 1 ]; then
+          USR1_FIRED=0
+        else
+          analyze_observations
+        fi
       done
     ' >> "$LOG_FILE" 2>&1 &
 
